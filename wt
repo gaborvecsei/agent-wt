@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+if [[ -n "${TRACE-}" ]]; then set -o xtrace; fi
+
+BOLD=$(tput bold 2>/dev/null || true)
+DIM=$(tput dim 2>/dev/null || true)
+RED=$(tput setaf 1 2>/dev/null || true)
+GREEN=$(tput setaf 2 2>/dev/null || true)
+YELLOW=$(tput setaf 3 2>/dev/null || true)
+NORMAL=$(tput sgr0 2>/dev/null || true)
+
+PICK_DELETE_KEY="ctrl-x"
+AGENT_W=6
+
+main_path="" container="" prefix="" agents_json="" pick_key="" pick_name=""
+WT_PREFIX="" WT_POST_CREATE=""
+WT_COPY=()
+
+usage() {
+  cat << EOF
+${BOLD}wt${NORMAL} - git worktree + tmux session manager
+
+Usage:
+  wt                           pick a worktree (fzf): enter attaches to its tmux session,
+                               ${PICK_DELETE_KEY} removes it after a confirmation, esc cancels
+  wt new <branch> [--from <ref>]
+                               create branch (if missing), worktree and tmux session, then switch to it.
+                               --from: start point for a new branch (default: origin/main)
+  wt resume|re [<name>]        same as bare wt; with <name> it skips the picker
+  wt ls                        list worktrees without the picker
+  wt rm [<name>] [-b] [--force]
+                               remove worktree + tmux session. Refuses if dirty/unpushed unless --force.
+                               -b also deletes the branch
+  wt init <git-url>            clone into <repo>/main, write a default <repo>/.wt.conf
+  wt init <path>               migrate an existing clone at <path> to <path>/main (asks for confirmation)
+                               and write a default .wt.conf if there is none
+  wt help
+
+Layout:   <container>/main (clone) + <container>/<branch> (worktrees)
+Config:   <container>/.wt.conf  (WT_PREFIX, WT_COPY=(...), WT_POST_CREATE)
+EOF
+  exit "${1-0}"
+}
+
+info() { echo -e "${GREEN}[*]${NORMAL} $1"; }
+warn() { echo >&2 -e "${YELLOW}[!]${NORMAL} $1"; }
+error() { echo >&2 -e "${RED}${BOLD}error:${NORMAL} $1"; }
+die() { error "$1"; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+confirm() {
+  local answer=""
+  read -r -p "$1 [y/N] " answer || true
+  [[ "$answer" == [Yy] ]]
+}
+
+g() { git -C "$main_path" "$@"; }
+main_worktree_of() { git -C "$1" worktree list --porcelain | sed -n '1s/^worktree //p'; }
+
+discover_repo() {
+  local git_root="."
+  if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    [[ -e "main/.git" ]] || die "not inside a git repository (or a wt container folder with main/)"
+    git_root="main"
+  fi
+  main_path=$(main_worktree_of "$git_root")
+  [[ "$(basename "$main_path")" == "main" ]] \
+    || die "main checkout is '${main_path}', expected a folder named 'main'.\n  Migrate with: wt init ${main_path}"
+  container=$(dirname "$main_path")
+  [[ -f "$container/.wt.conf" ]] && source "$container/.wt.conf"
+  prefix=${WT_PREFIX:-$(basename "$container")}
+  g worktree prune
+}
+
+name_for_branch() { echo "${1//\//-}"; }
+session_for_name() { echo "${prefix}-$1" | tr '.:' '__'; }
+path_for_name() { echo "$container/$1"; }
+default_base() { g symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || echo "origin/main"; }
+is_commit() { g rev-parse --verify --quiet "$1^{commit}" >/dev/null; }
+is_dirty() { [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]]; }
+has_agents() { command -v ma >/dev/null && command -v jq >/dev/null; }
+
+tmux_alive() { tmux has-session -t "=$1" 2>/dev/null; }
+tmux_owner() { tmux show-option -qv -t "=$1:" @wt_path 2>/dev/null || true; }
+
+tmux_check_owner() {
+  local session=$1 path=$2 owner
+  owner=$(tmux_owner "$session")
+  [[ -z "$owner" || "$owner" == "$path" ]] \
+    || die "tmux session '$session' belongs to another worktree: $owner\n  set WT_PREFIX in <container>/.wt.conf or pick another branch name"
+}
+
+tmux_open() {
+  local session=$1 path=$2
+  tmux_check_owner "$session" "$path"
+  if ! tmux_alive "$session"; then
+    tmux new-session -d -s "$session" -c "$path"
+    tmux set-option -t "=$session:" @wt_path "$path"
+    info "created tmux session ${BOLD}${session}${NORMAL}"
+  fi
+  if [[ -n "${TMUX-}" ]]; then tmux switch-client -t "=$session"; else tmux attach-session -t "=$session"; fi
+}
+
+tmux_kill() {
+  local session=$1 path=$2 owner
+  owner=$(tmux_owner "$session")
+  if [[ -n "$owner" && "$owner" != "$path" ]]; then
+    warn "tmux session '$session' belongs to another worktree ($owner), not killing it"
+    return 0
+  fi
+  tmux kill-session -t "=$session" 2>/dev/null && info "killed tmux session $session" || true
+}
+
+agent_glyphs() {
+  local path=$1 agent=$2 status waiting="" busy="" rest="" n=0
+  while read -r status; do
+    n=$((n + 1))
+    case "$status" in
+      waiting) waiting+="${RED}●${NORMAL}" ;;
+      busy) busy+="${GREEN}▶${NORMAL}" ;;
+      unknown) rest+="${DIM}?${NORMAL}" ;;
+      *) rest+="${DIM}○${NORMAL}" ;;
+    esac
+  done < <([[ -z "$agents_json" ]] || jq -r --arg p "$path" --arg a "$agent" \
+    '.[] | select(.agent == $a and (.cwd == $p or (.cwd | startswith($p + "/")))) | .status' <<< "$agents_json" 2>/dev/null)
+  printf '%s%s%s%*s' "$waiting" "$busy" "$rest" $((AGENT_W > n ? AGENT_W - n : 0)) ""
+}
+
+list_worktrees() {
+  g worktree list --porcelain | awk -v dir="$container/" '
+    sub(/^worktree /, "") { path = $0; branch = "(detached)" }
+    sub(/^branch refs\/heads\//, "") { branch = $0 }
+    /^$/ { name = substr(path, length(dir) + 1) }
+    /^$/ && index(path, dir) == 1 && name !~ /\// { print name "\t" branch "\t" path }'
+}
+
+worktree_of_branch() { list_worktrees | awk -F'\t' -v b="$1" '$2 == b { print $1; found = 1 } END { exit !found }'; }
+resolve_name() { worktree_of_branch "$1" || list_worktrees | cut -f1 | grep -xF -- "$1"; }
+
+print_row() {
+  local mark=$1 name=$2 branch=$3 dirty=$4 ahead_behind=$5 claude=$6 pi=$7
+  printf '%s %-24s %s%-30s%s %s%-2s%s %s%-8s%s  %s  %s\n' \
+    "$mark" "$name" "$DIM" "$branch" "$NORMAL" "$YELLOW" "$dirty" "$NORMAL" "$DIM" "$ahead_behind" "$NORMAL" "$claude" "$pi"
+}
+
+render_header() {
+  local claude="" pi=""
+  if has_agents; then claude=$(printf "%-${AGENT_W}s" claude); pi=pi; fi
+  printf '\t'; print_row " " name branch "" "+/-" "$claude" "$pi"
+}
+
+render_rows() {
+  local name branch path dirty ahead_behind mark claude pi
+  has_agents && agents_json=$(ma --json 2>/dev/null || true)
+  while IFS=$'\t' read -r name branch path; do
+    dirty=""; is_dirty "$path" && dirty="*"
+    ahead_behind=$(git -C "$path" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null | awk '{ print "+" $2 "/-" $1 }' || true)
+    if tmux_alive "$(session_for_name "$name")"; then mark="${GREEN}●${NORMAL}"; else mark="${DIM}○${NORMAL}"; fi
+    claude="" pi=""
+    if has_agents; then claude=$(agent_glyphs "$path" cc); pi=$(agent_glyphs "$path" pi); fi
+    printf '%s\t' "$name"
+    print_row "$mark" "$name" "$branch" "$dirty" "${ahead_behind:--}" "$claude" "$pi"
+  done < <(list_worktrees)
+}
+
+select_worktree() {
+  local prompt=$1 query=${2-} out
+  pick_key="" pick_name=""
+  if [[ -n "$query" ]]; then
+    pick_name=$(resolve_name "$query") || die "no worktree for '$query'"
+    return 0
+  fi
+  need fzf
+  out=$(render_rows | fzf --ansi --with-nth=2.. --delimiter='\t' --prompt="$prompt> " \
+    --header="  ${DIM}enter attach · ${PICK_DELETE_KEY} delete · esc cancel${NORMAL}"$'\n'"$(render_header | cut -f2-)" \
+    --height=40% --reverse --expect="$PICK_DELETE_KEY") || true
+  pick_key=$(sed -n 1p <<< "$out")
+  pick_name=$(sed -n 2p <<< "$out" | cut -f1)
+}
+
+cmd_new() {
+  local branch="" from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from=${2-}; [[ -n "$from" ]] || die "--from needs a ref"; shift ;;
+      -*) die "unknown option: $1" ;;
+      *) branch=$1 ;;
+    esac
+    shift
+  done
+  [[ -n "$branch" ]] || die "usage: wt new <branch> [--from <ref>]"
+  need tmux
+  discover_repo
+
+  local name path session existing
+  name=$(name_for_branch "$branch")
+  path=$(path_for_name "$name")
+  session=$(session_for_name "$name")
+  [[ "$name" == "main" ]] && die "'main' is the primary checkout, cannot create a worktree named main"
+
+  if existing=$(worktree_of_branch "$branch"); then
+    warn "worktree already exists: $(path_for_name "$existing")"
+    echo "  use: wt resume $existing"
+    exit 0
+  fi
+  [[ -e "$path" ]] && die "folder exists (another branch flattens to the same name, or it is not a registered worktree): $path"
+  tmux_check_owner "$session" "$path"
+
+  info "fetching origin..."
+  g fetch --quiet origin 2>/dev/null || warn "fetch failed (offline?), continuing with local refs"
+
+  if g show-ref --verify --quiet "refs/heads/$branch"; then
+    [[ -n "$from" ]] && warn "branch '$branch' already exists, --from ignored"
+    info "using existing local branch ${BOLD}${branch}${NORMAL}"
+    g worktree add "$path" "$branch"
+  elif g show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    [[ -n "$from" ]] && warn "branch '$branch' exists on origin, --from ignored"
+    info "tracking remote branch ${BOLD}origin/${branch}${NORMAL}"
+    g worktree add --track -b "$branch" "$path" "origin/$branch"
+  else
+    local base
+    base=${from:-$(default_base)}
+    if [[ -z "$from" ]] && ! is_commit "$base"; then base=$(g rev-parse --abbrev-ref HEAD); fi
+    is_commit "$base" || die "start point not found: $base"
+    info "creating branch ${BOLD}${branch}${NORMAL} from ${base}"
+    g worktree add --no-track -b "$branch" "$path" "$base"
+  fi
+
+  local f
+  for f in "${WT_COPY[@]-}"; do
+    f=${f%/}
+    [[ -n "$f" ]] || continue
+    if [[ -e "$main_path/$f" ]]; then
+      mkdir -p "$(dirname "$path/$f")"
+      cp -R "$main_path/$f" "$(dirname "$path/$f")/"
+      info "copied $f"
+    else
+      warn "WT_COPY entry not found in main: $f"
+    fi
+  done
+
+  if [[ -n "$WT_POST_CREATE" ]]; then
+    info "running post-create: ${DIM}${WT_POST_CREATE}${NORMAL}"
+    (cd "$path" && bash -c "$WT_POST_CREATE") || warn "post-create command failed"
+  fi
+
+  tmux_open "$session" "$path"
+}
+
+cmd_resume() {
+  need tmux
+  discover_repo
+  while :; do
+    select_worktree "wt" "${1-}"
+    [[ -n "$pick_name" ]] || exit 0
+    if [[ "$pick_key" == "$PICK_DELETE_KEY" ]]; then
+      if approve_removal "$pick_name" 0 1; then remove_worktree "$pick_name" 0 0; fi
+      continue
+    fi
+    tmux_open "$(session_for_name "$pick_name")" "$(path_for_name "$pick_name")"
+    return
+  done
+}
+
+cmd_ls() {
+  discover_repo
+  { render_header; render_rows; } | cut -f2-
+}
+
+cmd_rm() {
+  local target="" delete_branch=0 force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -b) delete_branch=1 ;;
+      -f | --force) force=1 ;;
+      -*) die "unknown option: $1" ;;
+      *) target=$1 ;;
+    esac
+    shift
+  done
+  need tmux
+  discover_repo
+
+  select_worktree "remove" "$target"
+  [[ -n "$pick_name" ]] || exit 0
+  approve_removal "$pick_name" "$force" 0 || exit 1
+  remove_worktree "$pick_name" "$delete_branch" "$force"
+}
+
+approve_removal() {
+  local name=$1 force=$2 always_confirm=$3
+  if [[ "$name" == "main" ]]; then
+    error "refusing to remove the main checkout"
+    return 1
+  fi
+
+  local path base unpushed ignored problems=()
+  path=$(path_for_name "$name")
+  base=$(default_base)
+
+  is_dirty "$path" && problems+=("uncommitted or untracked changes")
+  if unpushed=$(git -C "$path" rev-list --count '@{u}..HEAD' 2>/dev/null); then
+    [[ "$unpushed" -eq 0 ]] || problems+=("$unpushed commit(s) not pushed to upstream")
+  elif unpushed=$(git -C "$path" rev-list --count "$base..HEAD" 2>/dev/null); then
+    [[ "$unpushed" -eq 0 ]] || problems+=("no upstream, $unpushed commit(s) not in $base")
+  else
+    problems+=("cannot verify unpushed commits: no upstream and no $base")
+  fi
+
+  if [[ ${#problems[@]} -gt 0 ]]; then
+    if [[ $force -eq 0 ]]; then
+      error "refusing to remove ${name} (${path}):"
+      printf >&2 '  - %s\n' "${problems[@]}" "rerun with --force to remove anyway"
+      return 1
+    fi
+    warn "forcing removal despite: ${problems[*]}"
+  fi
+  [[ $force -eq 0 ]] || return 0
+
+  ignored=$(git -C "$path" ls-files --others --ignored --exclude-standard --directory 2>/dev/null \
+    | awk 'NR <= 5 { printf "%s ", $0 } END { if (NR > 5) printf "... +%d more", NR - 5 }')
+  if [[ -n "$ignored" ]]; then
+    warn "ignored files will be deleted: $ignored"
+  elif [[ $always_confirm -eq 0 ]]; then
+    return 0
+  fi
+  confirm "remove ${BOLD}${name}${NORMAL} (${path})?" || { echo "kept"; return 1; }
+}
+
+remove_worktree() {
+  local name=$1 delete_branch=$2 force=$3
+  local path session branch delete_flag="-d"
+  path=$(path_for_name "$name")
+  session=$(session_for_name "$name")
+  branch=$(git -C "$path" rev-parse --abbrev-ref HEAD)
+  [[ $force -eq 0 ]] || delete_flag="-D"
+
+  info "removing worktree ${BOLD}${name}${NORMAL} (${path})"
+  if [[ $force -eq 1 ]]; then g worktree remove --force "$path"; else g worktree remove "$path"; fi
+  info "worktree removed"
+
+  if [[ "$branch" != "HEAD" ]]; then
+    if [[ $delete_branch -eq 0 ]]; then
+      echo -e "${DIM}branch '${branch}' kept (use -b to delete)${NORMAL}"
+    elif g branch "$delete_flag" "$branch"; then
+      info "deleted branch $branch"
+    else
+      warn "branch '$branch' kept, use --force to delete it anyway"
+    fi
+  fi
+
+  if [[ -n "${TMUX-}" && "$(tmux display-message -p '#S' 2>/dev/null)" == "$session" ]]; then
+    tmux switch-client -l 2>/dev/null || tmux switch-client -n 2>/dev/null || true
+  fi
+  tmux_kill "$session" "$path"
+}
+
+cmd_init() {
+  local arg=${1-}
+  [[ -n "$arg" ]] || die "usage: wt init <git-url> | <path-to-existing-clone>"
+  if [[ -d "$arg" && "$(git -C "$arg" rev-parse --is-bare-repository 2>/dev/null)" != "true" ]]; then
+    init_migrate "$arg"
+  else
+    init_clone "$arg"
+  fi
+}
+
+init_clone() {
+  local url=$1 repo
+  repo=$(basename "$url" .git)
+  [[ -e "$repo" ]] && die "'$repo' already exists here"
+  info "cloning into ${repo}/main"
+  git clone "$url" "$repo/main"
+  init_done "$(pwd -P)/$repo"
+}
+
+write_default_conf() {
+  local conf="$1/.wt.conf"
+  if [[ -e "$conf" ]]; then
+    info "config exists, keeping it: $conf"
+    return 0
+  fi
+  cat > "$conf" << 'EOF'
+# wt config (plain bash, sourced by wt). Lives next to main/, not part of the repo.
+# Uncomment and edit what you need.
+
+# tmux session prefix (default: this folder's name)
+#WT_PREFIX="proj"
+
+# gitignored files/dirs copied from main/ into every new worktree
+#WT_COPY=(.env .claude/settings.local.json)
+
+# command run inside a new worktree after it is created
+#WT_POST_CREATE="uv sync"
+EOF
+  info "wrote default config: $conf"
+}
+
+init_done() {
+  write_default_conf "$1"
+  info "done. Next:"
+  echo "  cd $1/main && wt new <branch>"
+  echo "  config: $1/.wt.conf  (WT_PREFIX, WT_COPY=(...), WT_POST_CREATE)"
+}
+
+init_migrate() {
+  local top
+  top=$(cd "$1" && pwd -P)
+
+  [[ "$(git -C "$top" rev-parse --show-toplevel 2>/dev/null)" == "$top" ]] || die "not the root of a git repository: $top"
+  if [[ "$(basename "$top")" == "main" ]]; then
+    info "already in the expected layout: $top"
+    exit 0
+  fi
+  local main_wt linked
+  main_wt=$(main_worktree_of "$top")
+  linked=$(git -C "$top" worktree list | tail -n +2 | sed 's/^/  - /')
+  [[ "$main_wt" == "$top" ]] || die "$top is a linked worktree, not the main checkout (main is $main_wt)"
+  [[ -z "$linked" ]] || die "repository has linked worktrees. Remove or move them manually first:\n$linked"
+
+  local repo parent tmp
+  repo=$(basename "$top"); parent=$(dirname "$top"); tmp="${parent}/${repo}.wt-migrating"
+  [[ -e "$tmp" ]] && die "temporary path exists, remove it first: $tmp"
+  case "$(pwd -P)/" in "$top"/*) die "your shell is inside $top. cd out first (e.g. cd $parent)" ;; esac
+
+  is_dirty "$top" && warn "working tree has uncommitted changes (moving is still safe)"
+  [[ -d "$top/.venv" ]] && warn ".venv found: virtualenv paths will break, recreate it after the move"
+  if command -v tmux >/dev/null && tmux ls >/dev/null 2>&1; then
+    local stale
+    stale=$(tmux list-panes -a -F '#{session_name} #{pane_current_path}' | awk -v t="$top" 'index($2, t) == 1 { print $1 }' | sort -u | tr '\n' ' ')
+    [[ -n "$stale" ]] && warn "tmux session(s) with panes inside the repo will have a stale cwd: $stale"
+  fi
+
+  echo
+  echo -e "${BOLD}Plan:${NORMAL}"
+  echo "  mv    $top  ->  $tmp"
+  echo "  mkdir $top"
+  echo "  mv    $tmp  ->  $top/main"
+  echo
+  confirm "Proceed?" || { echo "aborted"; exit 1; }
+
+  if ! { mv "$top" "$tmp" && mkdir "$top" && mv "$tmp" "$top/main"; }; then
+    [[ -e "$tmp" ]] && { rmdir "$top" 2>/dev/null || true; mv "$tmp" "$top"; }
+    die "migration failed, repository left at its original location: $top"
+  fi
+  info "migrated. main checkout: $top/main"
+  git -C "$top/main" worktree list
+  init_done "$top"
+}
+
+main() {
+  need git
+  local cmd=${1-resume}
+  shift || true
+  case " $* " in *" -h "* | *" --help "*) usage ;; esac
+  case "$cmd" in
+    new) cmd_new "$@" ;;
+    resume | re) cmd_resume "$@" ;;
+    ls | list) cmd_ls ;;
+    rm | remove) cmd_rm "$@" ;;
+    init) cmd_init "$@" ;;
+    -h | --help | help) usage ;;
+    *) error "unknown command: $cmd"; usage 1 >&2 ;;
+  esac
+}
+
+main "$@"
