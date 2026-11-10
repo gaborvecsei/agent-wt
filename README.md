@@ -2,6 +2,8 @@
 
 Tiny git worktree + tmux helper for managing AI coding agents in parallel.
 
+![wt demo](demo/demo.gif)
+
 > why?
 
 Because I was tired of writing repetative commands over and over again.
