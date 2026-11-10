@@ -1,11 +1,18 @@
 # agent-wt (`wt`)
 
+Tiny git worktree + tmux helper for managing AI coding agents in parallel.
+
+> why?
+
+Because I was tired of writing repetative commands over and over again.
+And I was also tired of UI heavy bloated solutions packed with unnecessary features. I wanted something that just works, fast, and is easy to use.
+
 ## Requirements
 
 - `git`
 - `tmux`
 - `fzf` for the picker
-- Optional, but HIGHLY recommended: [`ma`](https://github.com/gaborvecsei/my-agents) and `jq`, for the agent status columns in the picker
+- Optional, but HIGHLY recommended as this allows the agent overview: [`ma`](https://github.com/gaborvecsei/my-agents) and `jq`, for the agent status columns in the picker
 
 ## Install
 
@@ -14,13 +21,11 @@ curl -fsSL --create-dirs https://raw.githubusercontent.com/gaborvecsei/agent-wt/
 chmod +x ~/.local/bin/wt
 ```
 
-Any directory on your `PATH` works.
-
-Then set up a repository in the layout above. `wt init` clones into `repo/main`, or moves an existing clone there, and writes a commented `.wt.conf`:
+### First setup for a repo
 
 ```sh
 wt init ~/code/repo                   # move an existing clone to ~/code/repo/main (asks first)
-wt init git@github.com:you/repo.git   # clone into repo/main
+wt init git@github.com:you/repo.git   # clone into repo/main immediately
 ```
 
 ## Usage
@@ -48,7 +53,7 @@ Each row in the picker and in `wt ls` shows:
 
 ## Config
 
-This is a bit of help, but completely optional.
+This is just a bit of help, and completely optional.
 
 `repo/.wt.conf`
 
