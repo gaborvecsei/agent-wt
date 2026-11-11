@@ -47,11 +47,14 @@ Each row in the picker and in `wt ls` shows:
 
 - `●` if the worktree's tmux session is running, `○` if it is not
 - the worktree name and its branch
+- the branch in yellow when it no longer matches the worktree name (switched inside the worktree)
 - `*` if the worktree has uncommitted changes
 - `+N/-M` for commits ahead of and behind the upstream branch
 - one glyph per Claude Code and pi agent in the worktree: `●` waiting for input, `▶` busy, `○` idle, `?` unknown. These columns need `ma` and `jq`.
 
-`wt rm` won't touch a worktree with uncommitted changes or unpushed commits unless you pass `--force`. Squash-merged branches with a deleted remote count as unpushed too.
+`wt rm` won't touch a worktree with uncommitted changes or unpushed commits unless you pass `--force`. Squash-merged branches with a deleted remote count as unpushed too. `-b` refuses if the branch was switched inside the worktree, since `wt` can't tell which branch you want gone.
+
+Agents sometimes switch branches inside a worktree. The folder and tmux session stay put, and `wt resume`/`wt rm` still accept the original branch name. To make it rarer, tell your agent to stay on its branch (e.g. in `CLAUDE.md`).
 
 ## Config
 

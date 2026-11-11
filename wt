@@ -31,7 +31,7 @@ Usage:
   wt ls                        list worktrees without the picker
   wt rm [<name>] [-b] [--force]
                                remove worktree + tmux session. Refuses if dirty/unpushed unless --force.
-                               -b also deletes the branch
+                               -b also deletes the branch, refuses if the branch was switched inside the worktree
   wt init <git-url>            clone into <repo>/main, write a default <repo>/.wt.conf
   wt init <path>               migrate an existing clone at <path> to <path>/main (asks for confirmation)
                                and write a default .wt.conf if there is none
@@ -136,12 +136,14 @@ list_worktrees() {
 }
 
 worktree_of_branch() { list_worktrees | awk -F'\t' -v b="$1" '$2 == b { print $1; found = 1 } END { exit !found }'; }
-resolve_name() { worktree_of_branch "$1" || list_worktrees | cut -f1 | grep -xF -- "$1"; }
+resolve_name() { worktree_of_branch "$1" || list_worktrees | cut -f1 | grep -xF -- "$(name_for_branch "$1")"; }
+branch_of_name() { list_worktrees | awk -F'\t' -v n="$1" '$1 == n { print $2 }'; }
+branch_switched() { [[ "$1" != "main" && "$1" != "$(name_for_branch "$2")" ]]; }
 
 print_row() {
-  local mark=$1 name=$2 branch=$3 dirty=$4 ahead_behind=$5 claude=$6 pi=$7
+  local mark=$1 name=$2 branch=$3 dirty=$4 ahead_behind=$5 claude=$6 pi=$7 branch_color=${8-$DIM}
   printf '%s %-24s %s%-30s%s %s%-2s%s %s%-8s%s  %s  %s\n' \
-    "$mark" "$name" "$DIM" "$branch" "$NORMAL" "$YELLOW" "$dirty" "$NORMAL" "$DIM" "$ahead_behind" "$NORMAL" "$claude" "$pi"
+    "$mark" "$name" "$branch_color" "$branch" "$NORMAL" "$YELLOW" "$dirty" "$NORMAL" "$DIM" "$ahead_behind" "$NORMAL" "$claude" "$pi"
 }
 
 render_header() {
@@ -151,16 +153,17 @@ render_header() {
 }
 
 render_rows() {
-  local name branch path dirty ahead_behind mark claude pi
+  local name branch path dirty ahead_behind mark claude pi branch_color
   has_agents && agents_json=$(ma --json 2>/dev/null || true)
   while IFS=$'\t' read -r name branch path; do
     dirty=""; is_dirty "$path" && dirty="*"
+    branch_color=$DIM; branch_switched "$name" "$branch" && branch_color=$YELLOW
     ahead_behind=$(git -C "$path" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null | awk '{ print "+" $2 "/-" $1 }' || true)
     if tmux_alive "$(session_for_name "$name")"; then mark="${GREEN}●${NORMAL}"; else mark="${DIM}○${NORMAL}"; fi
     claude="" pi=""
     if has_agents; then claude=$(agent_glyphs "$path" cc); pi=$(agent_glyphs "$path" pi); fi
     printf '%s\t' "$name"
-    print_row "$mark" "$name" "$branch" "$dirty" "${ahead_behind:--}" "$claude" "$pi"
+    print_row "$mark" "$name" "$branch" "$dirty" "${ahead_behind:--}" "$claude" "$pi" "$branch_color"
   done < <(list_worktrees)
 }
 
@@ -193,7 +196,7 @@ cmd_new() {
   need tmux
   discover_repo
 
-  local name path session existing
+  local name path session existing current
   name=$(name_for_branch "$branch")
   path=$(path_for_name "$name")
   session=$(session_for_name "$name")
@@ -204,7 +207,11 @@ cmd_new() {
     echo "  use: wt resume $existing"
     exit 0
   fi
-  [[ -e "$path" ]] && die "folder exists (another branch flattens to the same name, or it is not a registered worktree): $path"
+  if [[ -e "$path" ]]; then
+    current=$(branch_of_name "$name")
+    [[ -z "$current" ]] || die "worktree '$name' is on branch '$current', not '$branch'\n  use: wt resume $name"
+    die "folder exists but is not a registered worktree: $path"
+  fi
   tmux_check_owner "$session" "$path"
 
   info "fetching origin..."
@@ -284,6 +291,11 @@ cmd_rm() {
 
   select_worktree "remove" "$target"
   [[ -n "$pick_name" ]] || exit 0
+  local branch
+  branch=$(branch_of_name "$pick_name")
+  if [[ $delete_branch -eq 1 ]] && branch_switched "$pick_name" "$branch"; then
+    die "worktree '$pick_name' is on branch '$branch', which changed since wt new, so -b won't guess which branch to delete\n  rerun without -b, then delete branches with git branch -d"
+  fi
   approve_removal "$pick_name" "$force" 0 || exit 1
   remove_worktree "$pick_name" "$delete_branch" "$force"
 }
